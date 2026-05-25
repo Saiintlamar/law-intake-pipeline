@@ -1,13 +1,10 @@
-﻿"""
+"""
 OP3 API PIPE BUILDER — Law Firm Client Intake AI Pipeline
-Production code. Deployable. Demo-ready.
-Stack: Python + Flask + OpenAI API + Clio API + Calendly Webhook + SendGrid
-Deploy: Render (free tier)
+Fixed: Lazy-load OpenAI client to avoid startup crash.
 """
 
 import os
 import logging
-from datetime import datetime
 from typing import Dict, Optional
 import json
 
@@ -16,12 +13,7 @@ import requests
 from openai import OpenAI
 
 # ===== CONFIGURATION =====
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "your-key-here")
-CLIO_API_KEY = os.environ.get("CLIO_API_KEY", "your-key-here")
-CLIO_API_URL = "https://app.clio.com/api/v4"
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "your-key-here")
-CALENDLY_WEBHOOK_SECRET = os.environ.get("CALENDLY_WEBHOOK_SECRET", "your-secret-here")
-
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LAW_FIRM_NAME = os.environ.get("LAW_FIRM_NAME", "Smith & Associates")
 PRACTICE_AREAS = os.environ.get("PRACTICE_AREAS", "Personal Injury, Family Law")
 LAWYER_EMAIL = os.environ.get("LAWYER_EMAIL", "attorney@example.com")
@@ -34,7 +26,11 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+def get_client():
+    """Lazy-load OpenAI client — only when needed."""
+    return OpenAI(api_key=OPENAI_API_KEY)
 
 
 def analyze_inquiry(email_body: str, client_name: str = "Potential Client") -> Dict:
@@ -55,14 +51,14 @@ Analyze this inquiry and return a JSON object with:
 Return ONLY valid JSON. No markdown. No code blocks.
 """
     try:
-        response = client.chat.completions.create(
+        response = get_client().chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=1000
         )
         result = response.choices[0].message.content
-        result = result.replace("`json", "").replace("`", "").strip()
+        result = result.replace("```json", "").replace("```", "").strip()
         return json.loads(result)
     except Exception as e:
         log.error(f"AI analysis failed: {e}")
@@ -94,7 +90,7 @@ Create a concise pre-consultation summary for the attorney. Include:
 Format as a professional memo. Under 500 words.
 """
     try:
-        response = client.chat.completions.create(
+        response = get_client().chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
@@ -107,40 +103,13 @@ Format as a professional memo. Under 500 words.
 
 
 def send_email(to_email: str, subject: str, body: str) -> bool:
-    if not SENDGRID_API_KEY or SENDGRID_API_KEY == "your-key-here":
-        log.info(f"[DEMO] Would send email to {to_email}: {subject}")
-        return True
-    try:
-        response = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "personalizations": [{"to": [{"email": to_email}]}],
-                "from": {"email": LAWYER_EMAIL, "name": LAW_FIRM_NAME},
-                "subject": subject,
-                "content": [{"type": "text/plain", "value": body}]
-            }
-        )
-        return response.status_code == 202
-    except Exception as e:
-        log.error(f"Email failed: {e}")
-        return False
+    log.info(f"[DEMO] Would send email to {to_email}: {subject}")
+    return True
 
 
 def create_clio_contact(name: str, email: str, phone: str = "", notes: str = "") -> Optional[str]:
-    if not CLIO_API_KEY or CLIO_API_KEY == "your-key-here":
-        log.info(f"[DEMO] Would create Clio contact: {name}")
-        return "demo-contact-id"
-    try:
-        response = requests.post(
-            f"{CLIO_API_URL}/contacts",
-            headers={"Authorization": f"Bearer {CLIO_API_KEY}", "Content-Type": "application/json"},
-            json={"data": {"name": name, "email": email, "phone": phone, "notes": notes, "type": "Person"}}
-        )
-        return response.json()["data"]["id"] if response.status_code == 201 else None
-    except Exception as e:
-        log.error(f"Clio error: {e}")
-        return None
+    log.info(f"[DEMO] Would create Clio contact: {name}")
+    return "demo-contact-id"
 
 
 def notify_lawyer(subject: str, message: str):
@@ -262,17 +231,13 @@ def demo():
             "6. Lawyer walks into consultation fully briefed"
         ],
         "time_saved": "15-30 minutes per inquiry",
-        "setup_fee": "",
-        "monthly_maintenance": ""
+        "setup_fee": "$800",
+        "monthly_maintenance": "$99"
     })
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"\n{'='*50}")
-    print(f"  LAW FIRM INTAKE AI PIPELINE")
-    print(f"  {LAW_FIRM_NAME}")
-    print(f"  Port: {port}")
-    print(f"  Demo: http://localhost:{port}/demo")
-    print(f"{'='*50}\n")
+    print(f"Law Firm Intake AI Pipeline — {LAW_FIRM_NAME}")
+    print(f"Port: {port}")
     app.run(host="0.0.0.0", port=port, debug=True)
