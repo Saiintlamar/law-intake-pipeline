@@ -29,8 +29,11 @@ app = Flask(__name__)
 
 
 def get_client():
-    """Lazy-load OpenAI client — only when needed."""
-    return OpenAI(api_key=OPENAI_API_KEY)
+    """Lazy-load Gemini client via OpenAI compatibility layer."""
+    return OpenAI(
+        api_key=AIzaSyCVowVIlDcj38azQvJ4UDydpjCDM7Pzaz8,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
 
 
 def analyze_inquiry(email_body: str, client_name: str = "Potential Client") -> Dict:
@@ -52,7 +55,7 @@ Return ONLY valid JSON. No markdown. No code blocks.
 """
     try:
         response = get_client().chat.completions.create(
-            model="gpt-4o-mini",
+            model="gemini-2.5-flash",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=1000
@@ -91,7 +94,7 @@ Format as a professional memo. Under 500 words.
 """
     try:
         response = get_client().chat.completions.create(
-            model="gpt-4o-mini",
+            model="gemini-2.5-flash",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=800
