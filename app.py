@@ -16,7 +16,7 @@ from flask import Flask, request, jsonify
 from openai import OpenAI
 
 # ===== CONFIGURATION =====
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("AIzaSyCVowVIlDcj38azQvJ4UDydpjCDM7Pzaz8", "")
 LAW_FIRM_NAME = os.environ.get("LAW_FIRM_NAME", "Smith & Associates")
 PRACTICE_AREAS = os.environ.get("PRACTICE_AREAS", "Personal Injury, Family Law")
 LAWYER_EMAIL = os.environ.get("LAWYER_EMAIL", "attorney@example.com")
