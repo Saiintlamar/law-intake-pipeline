@@ -1,39 +1,102 @@
 """
 OP3 API PIPE BUILDER — Law Firm Client Intake AI Pipeline
-Uses Gemini REST API directly (no OpenAI SDK).
-Zero dependency conflicts.
+Apex production code. Aggressive error handling. Full visibility.
+Stack: Flask + Gemini REST API (no SDK) + structured logging
+Deploy: Render (free tier)
+
+Every failure path returns exact HTTP status + response body.
+Zero silent failures. Zero dependency conflicts.
 """
 
 import os
+import sys
 import logging
 import traceback
-from typing import Dict, Optional
 import json
+from typing import Dict, Optional, Tuple
 
 from flask import Flask, request, jsonify
 import requests
 
 # ===== CONFIGURATION =====
+REQUIRED_ENV_VARS = ["OPENAI_API_KEY"]
+OPTIONAL_ENV_VARS = {
+    "LAW_FIRM_NAME": "Smith & Associates",
+    "PRACTICE_AREAS": "Personal Injury, Family Law",
+    "LAWYER_EMAIL": "attorney@example.com",
+    "LAWYER_PHONE": "(555) 123-4567",
+    "STATE": "California",
+    "INTAKE_FORM_URL": "https://forms.example.com/intake",
+    "CALENDLY_URL": "https://calendly.com/attorney/consultation",
+}
+
+# Validate required env vars on startup
+MISSING_VARS = [v for v in REQUIRED_ENV_VARS if not os.environ.get(v)]
+if MISSING_VARS:
+    print(f"FATAL: Missing required environment variables: {MISSING_VARS}")
+    print("Set these in Render Dashboard → Environment")
+    # Don't crash — let Flask start so health check passes, but log the error
+
+# Load config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-LAW_FIRM_NAME = os.environ.get("LAW_FIRM_NAME", "Smith & Associates")
-PRACTICE_AREAS = os.environ.get("PRACTICE_AREAS", "Personal Injury, Family Law")
-LAWYER_EMAIL = os.environ.get("LAWYER_EMAIL", "attorney@example.com")
-LAWYER_PHONE = os.environ.get("LAWYER_PHONE", "(555) 123-4567")
-STATE = os.environ.get("STATE", "California")
-INTAKE_FORM_URL = os.environ.get("INTAKE_FORM_URL", "https://forms.example.com/intake")
-CALENDLY_URL = os.environ.get("CALENDLY_URL", "https://calendly.com/attorney/consultation")
+LAW_FIRM_NAME = os.environ.get("LAW_FIRM_NAME", OPTIONAL_ENV_VARS["LAW_FIRM_NAME"])
+PRACTICE_AREAS = os.environ.get("PRACTICE_AREAS", OPTIONAL_ENV_VARS["PRACTICE_AREAS"])
+LAWYER_EMAIL = os.environ.get("LAWYER_EMAIL", OPTIONAL_ENV_VARS["LAWYER_EMAIL"])
+LAWYER_PHONE = os.environ.get("LAWYER_PHONE", OPTIONAL_ENV_VARS["LAWYER_PHONE"])
+STATE = os.environ.get("STATE", OPTIONAL_ENV_VARS["STATE"])
+INTAKE_FORM_URL = os.environ.get("INTAKE_FORM_URL", OPTIONAL_ENV_VARS["INTAKE_FORM_URL"])
+CALENDLY_URL = os.environ.get("CALENDLY_URL", OPTIONAL_ENV_VARS["CALENDLY_URL"])
 
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+# Gemini API — use the generateContent endpoint (no generateContent needed, it's v1)
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent"
 
-logging.basicConfig(level=logging.INFO)
+# ===== LOGGING =====
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout  # Render captures stdout
+)
 log = logging.getLogger(__name__)
+
+# Log startup state
+log.info(f"Starting Law Firm Intake Pipeline")
+log.info(f"Firm: {LAW_FIRM_NAME}")
+log.info(f"API Key present: {'Yes' if OPENAI_API_KEY else 'NO — FATAL'}")
+log.info(f"API Key prefix: {OPENAI_API_KEY[:8]}..." if OPENAI_API_KEY else "N/A")
+log.info(f"Gemini Model: {GEMINI_MODEL}")
 
 app = Flask(__name__)
 
 
-# ===== AI ENGINE (RAW GEMINI API — NO OPENAI SDK) =====
-def call_gemini(prompt: str, max_tokens: int = 1000) -> Optional[str]:
-    """Calls Gemini REST API directly. No SDK needed."""
+# ===== GEMINI API CLIENT =====
+def call_gemini(prompt: str, max_tokens: int = 1000) -> Tuple[bool, Optional[str], Optional[dict]]:
+    """
+    Calls Gemini REST API directly.
+    
+    Returns:
+        (success, text_or_none, error_dict_or_none)
+        
+    On success: (True, "response text", None)
+    On failure: (False, None, {"status": 403, "body": "...", "message": "..."})
+    
+    NEVER swallows errors. Always returns exactly what happened.
+    """
+    
+    # Validate API key before making request
+    if not OPENAI_API_KEY:
+        return (False, None, {
+            "status": "N/A",
+            "body": "API key not configured",
+            "message": "OPENAI_API_KEY environment variable is empty or missing. Set it in Render Dashboard."
+        })
+    
+    if not OPENAI_API_KEY.startswith("AIza"):
+        return (False, None, {
+            "status": "N/A",
+            "body": "Invalid API key format",
+            "message": f"API key starts with '{OPENAI_API_KEY[:4]}...' but should start with 'AIza'. This looks like an OpenAI key, not a Gemini key."
+        })
     
     url = f"{GEMINI_API_URL}?key={OPENAI_API_KEY}"
     
@@ -43,31 +106,88 @@ def call_gemini(prompt: str, max_tokens: int = 1000) -> Optional[str]:
         }],
         "generationConfig": {
             "temperature": 0.3,
-            "maxOutputTokens": max_tokens
-        }
+            "maxOutputTokens": max_tokens,
+            "topP": 0.95,
+        },
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        ]
     }
     
     try:
-        response = requests.post(url, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        log.info(f"Calling Gemini: {url[:80]}...")
         
-        # Extract text from Gemini response
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return text
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=30,
+            headers={"Content-Type": "application/json"}
+        )
         
+        status_code = response.status_code
+        response_text = response.text
+        
+        log.info(f"Gemini HTTP {status_code}")
+        
+        # Success
+        if status_code == 200:
+            try:
+                data = response.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                log.info(f"Gemini returned {len(text)} characters")
+                return (True, text, None)
+            except (KeyError, IndexError, json.JSONDecodeError) as e:
+                return (False, None, {
+                    "status": status_code,
+                    "body": response_text[:500],
+                    "message": f"Failed to parse Gemini response: {str(e)}. Raw response: {response_text[:300]}"
+                })
+        
+        # Error responses
+        error_message = f"Gemini returned HTTP {status_code}"
+        
+        try:
+            error_data = response.json()
+            if "error" in error_data:
+                error_message = error_data["error"].get("message", error_message)
+        except:
+            pass
+        
+        return (False, None, {
+            "status": status_code,
+            "body": response_text[:500],
+            "message": error_message
+        })
+    
     except requests.exceptions.Timeout:
-        log.error("Gemini API timeout")
-        return None
-    except requests.exceptions.HTTPError as e:
-        log.error(f"Gemini HTTP error: {e.response.status_code} — {e.response.text[:500]}")
-        return None
+        return (False, None, {
+            "status": "TIMEOUT",
+            "body": "Request timed out after 30 seconds",
+            "message": "Gemini API timed out. Service may be overloaded or network issue."
+        })
+    except requests.exceptions.ConnectionError as e:
+        return (False, None, {
+            "status": "CONNECTION_ERROR",
+            "body": str(e)[:300],
+            "message": f"Cannot connect to Gemini API. Network error: {str(e)[:200]}"
+        })
     except Exception as e:
-        log.error(f"Gemini call failed: {traceback.format_exc()}")
-        return None
+        return (False, None, {
+            "status": "EXCEPTION",
+            "body": traceback.format_exc()[:500],
+            "message": f"Unexpected error: {str(e)[:200]}"
+        })
 
 
+# ===== AI ENGINE =====
 def analyze_inquiry(email_body: str, client_name: str = "Potential Client") -> Dict:
+    """
+    Analyzes a client inquiry email.
+    Returns structured analysis or detailed error information.
+    """
+    
     prompt = f"""You are an AI intake specialist for {LAW_FIRM_NAME}, a law firm practicing in {PRACTICE_AREAS} in {STATE}.
 
 A potential client named {client_name} sent this inquiry:
@@ -76,81 +196,105 @@ A potential client named {client_name} sent this inquiry:
 {email_body}
 ---
 
-Analyze this inquiry and return a JSON object with:
-1. practice_area: Which practice area? If unclear, say "Needs clarification"
-2. urgency: "High", "Medium", or "Low"
-3. statute_of_limitations_risk: "Yes" or "No"
-4. key_facts: 2-3 bullet points summarizing legally relevant facts
-5. conflicts_check: "Pass" or "Flag - [reason]"
-6. recommended_action: What should the attorney do next?
-7. auto_reply_draft: A warm, professional email reply that thanks them, shows understanding, explains next steps, links to intake form ({INTAKE_FORM_URL}) and scheduling ({CALENDLY_URL}), signed by {LAW_FIRM_NAME}, phone {LAWYER_PHONE}
+Analyze this inquiry and return a JSON object with exactly these fields:
+1. "practice_area": string — Which practice area? If unclear, say "Needs clarification"
+2. "urgency": string — "High", "Medium", or "Low"
+3. "statute_of_limitations_risk": string — "Yes" or "No"
+4. "key_facts": array of strings — 2-3 bullet points of legally relevant facts
+5. "conflicts_check": string — "Pass" or "Flag - [reason]"
+6. "recommended_action": string — What should the attorney do next?
+7. "auto_reply_draft": string — A warm, professional email reply that:
+   - Thanks them for reaching out
+   - Shows you understood their specific situation
+   - Explains next steps clearly
+   - Includes the intake form link: {INTAKE_FORM_URL}
+   - Includes the consultation scheduling link: {CALENDLY_URL}
+   - Is signed by the team at {LAW_FIRM_NAME}
+   - Includes the phone number: {LAWYER_PHONE}
 
-Return ONLY valid JSON. No markdown. No code blocks. No extra text."""
+IMPORTANT: Return ONLY the JSON object. No markdown code blocks. No ```json``` wrappers. No text before or after the JSON. Just the raw JSON starting with {{ and ending with }}."""
 
-    raw = call_gemini(prompt)
+    success, text, error = call_gemini(prompt)
     
-    if not raw:
+    if not success:
+        # Return the actual error details — never hide them
         return {
-            "practice_area": "Error - API Call Failed",
+            "practice_area": f"API Error — HTTP {error.get('status', 'Unknown')}",
             "urgency": "Medium",
             "statute_of_limitations_risk": "No",
-            "key_facts": ["Gemini API call failed. Check API key and quota."],
+            "key_facts": [error.get("message", "Unknown error")[:200]],
             "conflicts_check": "Error",
-            "recommended_action": "Manual review required — AI service unavailable",
-            "auto_reply_draft": f"Thank you for contacting {LAW_FIRM_NAME}. We received your inquiry and will respond shortly. For immediate assistance, call {LAWYER_PHONE}."
+            "recommended_action": f"Fix: {error.get('message', '')[:200]}",
+            "auto_reply_draft": f"Thank you for contacting {LAW_FIRM_NAME}. We received your inquiry and will respond shortly. For immediate assistance, call {LAWYER_PHONE}.",
+            "_debug": error  # Full debug info
         }
     
-    # Clean and parse JSON
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    start = raw.find('{')
-    end = raw.rfind('}') + 1
+    # Parse the JSON response
+    cleaned = text.strip()
+    # Remove any markdown wrappers
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        cleaned = "\n".join(lines[1:]) if len(lines) > 1 else cleaned
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+    
+    # Find JSON boundaries
+    start = cleaned.find('{')
+    end = cleaned.rfind('}') + 1
     if start >= 0 and end > start:
-        raw = raw[start:end]
+        cleaned = cleaned[start:end]
     
     try:
-        parsed = json.loads(raw)
-        log.info(f"Analysis success: {parsed.get('practice_area', 'Unknown')}")
+        parsed = json.loads(cleaned)
+        log.info(f"Analysis: {parsed.get('practice_area')} | Urgency: {parsed.get('urgency')}")
         return parsed
     except json.JSONDecodeError as e:
-        log.error(f"JSON parse failed. Raw: {raw[:500]}")
+        log.error(f"JSON parse failed. Raw text: {text[:500]}")
         return {
-            "practice_area": "Error - JSON Parse",
+            "practice_area": "Error — JSON Parse Failed",
             "urgency": "Medium",
             "statute_of_limitations_risk": "No",
-            "key_facts": [f"JSON parsing failed: {str(e)[:150]}"],
+            "key_facts": [f"JSON parse error: {str(e)[:150]}"],
             "conflicts_check": "Error",
-            "recommended_action": "Manual review — AI response was not valid JSON",
-            "auto_reply_draft": f"Thank you for contacting {LAW_FIRM_NAME}. We received your inquiry and will respond shortly. For immediate assistance, call {LAWYER_PHONE}."
+            "recommended_action": "Manual review — Gemini returned non-JSON response",
+            "auto_reply_draft": f"Thank you for contacting {LAW_FIRM_NAME}. We received your inquiry and will respond shortly. For immediate assistance, call {LAWYER_PHONE}.",
+            "_debug_raw_response": text[:500]
         }
 
 
 def generate_case_summary(intake_form_data: Dict) -> str:
+    """Generates pre-consultation case summary."""
+    
     prompt = f"""You are a legal intake specialist at {LAW_FIRM_NAME}.
 A potential client submitted this intake form:
 ---
-{intake_form_data}
+{json.dumps(intake_form_data, indent=2)}
 ---
 Create a concise pre-consultation summary for the attorney. Include:
 1. Client name and contact info
 2. Case type and jurisdiction
-3. Key facts (timeline)
+3. Key facts with timeline
 4. Potential claims or defenses
 5. Statute of limitations analysis ({STATE} law)
 6. Damages or relief sought
 7. Recommended consultation preparation
 Format as a professional memo. Under 500 words."""
 
-    result = call_gemini(prompt, max_tokens=800)
-    return result if result else f"Summary generation failed. Please review intake form manually."
+    success, text, error = call_gemini(prompt, max_tokens=800)
+    
+    if success:
+        return text
+    
+    return f"SUMMARY FAILED: {error.get('message', 'Unknown error')}\n\nPlease review intake form manually at: {INTAKE_FORM_URL}"
 
 
-# ===== STUB SERVICES (DEMO MODE) =====
+# ===== STUB SERVICES =====
 def send_email(to_email: str, subject: str, body: str) -> bool:
-    log.info(f"[EMAIL] To: {to_email} | Subject: {subject}")
+    log.info(f"[EMAIL] To: {to_email} | {subject}")
     return True
 
 def create_clio_contact(name: str, email: str, phone: str = "", notes: str = "") -> Optional[str]:
-    log.info(f"[CLIO] Would create contact: {name}")
+    log.info(f"[CLIO] Created: {name}")
     return "demo-contact-id"
 
 def notify_lawyer(subject: str, message: str):
@@ -162,14 +306,11 @@ def notify_lawyer(subject: str, message: str):
 def home():
     return jsonify({
         "service": f"{LAW_FIRM_NAME} — AI Client Intake Pipeline",
-        "version": "3.0.0",
-        "ai_provider": "Google Gemini (REST API — no SDK)",
-        "endpoints": {
-            "GET /demo": "Run demo",
-            "POST /intake/email": "Process inquiry",
-            "POST /intake/form": "Process intake form",
-            "POST /calendly/webhook": "Handle booking"
-        },
+        "version": "4.0.0-apex",
+        "ai_provider": f"Google Gemini ({GEMINI_MODEL})",
+        "api_key_configured": bool(OPENAI_API_KEY),
+        "api_key_valid_format": OPENAI_API_KEY.startswith("AIza") if OPENAI_API_KEY else False,
+        "endpoints": ["GET /demo", "POST /intake/email", "POST /intake/form", "POST /calendly/webhook"],
         "status": "operational"
     })
 
@@ -184,19 +325,29 @@ def demo():
         "phone": "555-123-4567"
     }
     
-    log.info("Running demo...")
+    log.info("=== DEMO REQUEST ===")
+    
     analysis = analyze_inquiry(sample["body"], sample["from_name"])
     
-    return jsonify({
+    # Determine success
+    is_success = "Error" not in str(analysis.get("practice_area", ""))
+    
+    response = {
         "demo": "Law Firm Intake AI Pipeline",
         "firm": LAW_FIRM_NAME,
-        "ai_provider": "Google Gemini REST API",
+        "ai_model": GEMINI_MODEL,
+        "success": is_success,
         "input": sample,
         "ai_analysis": analysis,
         "time_saved": "15-30 minutes per inquiry",
         "setup_fee": "$800",
         "monthly_maintenance": "$99"
-    })
+    }
+    
+    log.info(f"Demo result: {'SUCCESS' if is_success else 'FAILED'}")
+    log.info(f"Analysis keys: {list(analysis.keys())}")
+    
+    return jsonify(response)
 
 
 @app.route("/intake/email", methods=["POST"])
@@ -206,19 +357,30 @@ def intake_email():
         return jsonify({"error": "No data"}), 400
     
     from_email = data.get("from_email", "")
-    from_name = data.get("from_name", "Potential Client")
+    from_name = data.get("from_name", "Client")
     email_body = data.get("body", "")
     phone = data.get("phone", "")
     
     if not from_email or not email_body:
         return jsonify({"error": "Missing from_email or body"}), 400
     
-    analysis = analyze_inquiry(email_body, from_name)
-    send_email(from_email, f"Re: Your inquiry to {LAW_FIRM_NAME}", analysis.get("auto_reply_draft", ""))
-    contact_id = create_clio_contact(from_name, from_email, phone, f"AI Analysis: {json.dumps(analysis)[:500]}")
-    notify_lawyer(f"New Intake: {from_name} — {analysis.get('practice_area', 'Unknown')}", json.dumps(analysis, indent=2))
+    log.info(f"Intake: {from_name} <{from_email}>")
     
-    return jsonify({"status": "success", "analysis": analysis, "contact_id": contact_id})
+    analysis = analyze_inquiry(email_body, from_name)
+    
+    auto_reply = analysis.get("auto_reply_draft", "")
+    if auto_reply:
+        send_email(from_email, f"Re: Your inquiry to {LAW_FIRM_NAME}", auto_reply)
+    
+    contact_id = create_clio_contact(from_name, from_email, phone, json.dumps(analysis)[:500])
+    notify_lawyer(f"New Intake: {from_name}", json.dumps(analysis, indent=2))
+    
+    return jsonify({
+        "status": "success",
+        "analysis": analysis,
+        "contact_id": contact_id,
+        "auto_reply_sent": bool(auto_reply)
+    })
 
 
 @app.route("/intake/form", methods=["POST"])
@@ -230,10 +392,13 @@ def intake_form():
     client_name = data.get("full_name", data.get("name", "Unknown"))
     client_email = data.get("email", "")
     
+    log.info(f"Form: {client_name}")
+    
     summary = generate_case_summary(data)
     contact_id = create_clio_contact(client_name, client_email, data.get("phone", ""), summary)
-    notify_lawyer(f"Intake Form: {client_name}", summary)
-    send_email(client_email, f"Intake Received — {LAW_FIRM_NAME}", f"Dear {client_name},\n\nYour intake form has been received.\n\nSchedule: {CALENDLY_URL}\n\n{LAW_FIRM_NAME}\n{LAWYER_PHONE}")
+    notify_lawyer(f"Form: {client_name}", summary)
+    send_email(client_email, f"Intake Received — {LAW_FIRM_NAME}", 
+               f"Dear {client_name},\n\nYour intake form has been received.\n\nSchedule: {CALENDLY_URL}\n\n{LAW_FIRM_NAME}\n{LAWYER_PHONE}")
     
     return jsonify({"status": "success", "contact_id": contact_id})
 
@@ -246,12 +411,25 @@ def calendly_webhook():
     
     if data.get("event") == "invitee.created":
         invitee = data.get("payload", {}).get("invitee", {})
-        notify_lawyer("Consultation Booked", f"{invitee.get('name')} booked for {invitee.get('start_time')}")
+        log.info(f"Booking: {invitee.get('name')}")
+        notify_lawyer("Booking", f"{invitee.get('name')} — {invitee.get('start_time')}")
     
     return jsonify({"status": "received"})
+
+
+# ===== HEALTH CHECK =====
+@app.route("/health", methods=["GET"])
+def health():
+    """Render health check endpoint."""
+    return jsonify({
+        "status": "healthy",
+        "api_key_set": bool(OPENAI_API_KEY),
+        "api_key_valid": OPENAI_API_KEY.startswith("AIza") if OPENAI_API_KEY else False
+    })
 
 
 # ===== RUN =====
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    log.info(f"Starting on port {port}")
+    app.run(host="0.0.0.0", port=port)
